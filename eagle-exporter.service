@@ -1,0 +1,20 @@
+[Unit]
+Description=Eagle Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/eagle
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/default/eagle-exporter
+ExecStart=/home/pi/eagle/.venv/bin/python3 /home/pi/eagle/eagle-exporter.py $EAGLE_EXPORTER_ARGS
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
