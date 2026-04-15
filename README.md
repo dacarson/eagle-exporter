@@ -1,4 +1,4 @@
-# eagle-exporter
+# Eagle Exporter
 
 Lightweight Python exporter for the Rainforest Automation Eagle local API.
 
