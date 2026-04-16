@@ -260,6 +260,25 @@ def parse_scalar_value(value):
     return value
 
 
+def normalize_wifi_status_fields(wifi_status):
+    """Normalize wifi_status types to match stable Influx field schema."""
+    if not isinstance(wifi_status, Mapping):
+        return wifi_status
+
+    normalized = {}
+    for key, value in wifi_status.items():
+        key_str = str(key)
+        if value is None:
+            continue
+
+        if key_str == "last_up_time":
+            normalized[key_str] = parse_scalar_value(value)
+        else:
+            normalized[key_str] = str(value)
+
+    return normalized
+
+
 def sanitize_identifier(value):
     text = re.sub(r"[^A-Za-z0-9_]", "_", str(value or "unknown"))
     text = re.sub(r"_+", "_", text).strip("_")
@@ -370,7 +389,7 @@ def collect_inventory_data():
 
     wifi_status = safe_local_call("wifi_status", fetch_wifi_status)
     if wifi_status is not None:
-        snapshot["wifi_status"] = wifi_status
+        snapshot["wifi_status"] = normalize_wifi_status_fields(wifi_status)
 
     devices = safe_local_call("device_list", fetch_device_list, default=[])
     if not devices:
