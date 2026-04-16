@@ -5,54 +5,164 @@ import json
 import re
 import time
 from collections.abc import Mapping, Sequence
+from xml.etree import ElementTree
 
-import eagle  # from rfa-eagle-api
-
-
-def configure_eagle_timeout(timeout_seconds):
-    """Override Eagle localapi request timeout."""
-    original_post = eagle.localapi.requests.post
-
-    def post_with_timeout(*args, **kwargs):
-        kwargs["timeout"] = timeout_seconds
-        return original_post(*args, **kwargs)
-
-    eagle.localapi.requests.post = post_with_timeout
+import requests
 
 
-def object_to_data(value):
-    """Best-effort conversion to JSON-serializable Python data."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(k): object_to_data(v) for k, v in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [object_to_data(v) for v in value]
+def safe_local_call(description, callback, default=None):
+    """Run direct local API call and return default on failures."""
+    try:
+        return callback()
+    except Exception as e:
+        print(f"Eagle local API call failed ({description}): {e}")
+        return default
 
-    for method_name in ("to_json", "as_json", "json"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                raw = method()
-                if isinstance(raw, str):
-                    try:
-                        return json.loads(raw)
-                    except json.JSONDecodeError:
-                        return raw
-                return object_to_data(raw)
-            except Exception:
-                pass
 
-    if hasattr(value, "__dict__"):
-        data = {}
-        for k, v in vars(value).items():
-            if callable(v) or (k.startswith("__") and k.endswith("__")):
-                continue
-            key = k[1:] if k.startswith("_") else k
-            data[str(key)] = object_to_data(v)
-        return data
+def to_snake_case(name):
+    text = str(name or "").strip()
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+    return text.strip("_").lower()
 
-    return str(value)
+
+def text_or_none(element):
+    if element is None or element.text is None:
+        return None
+    value = element.text.strip()
+    return value if value else None
+
+
+def parse_variable(variable_element):
+    # device_query responses use nested fields; device_details may return text-only variables.
+    children = list(variable_element)
+    if not children:
+        return {"name": text_or_none(variable_element)}
+
+    parsed = {}
+    for child in children:
+        parsed[to_snake_case(child.tag)] = text_or_none(child)
+    return parsed
+
+
+def parse_component(component_element):
+    parsed = {}
+    for child in component_element:
+        key = to_snake_case(child.tag)
+        if key == "variables":
+            parsed["variables"] = [
+                parse_variable(variable_element)
+                for variable_element in child.findall("./Variable")
+            ]
+        else:
+            parsed[key] = text_or_none(child)
+    return parsed
+
+
+def parse_device_response(xml_text):
+    root = ElementTree.fromstring(xml_text)
+    if root.tag != "Device":
+        raise ValueError(f"Expected <Device> response, got <{root.tag}>")
+
+    device = {}
+    details = root.find("./DeviceDetails")
+    if details is not None:
+        details_data = {}
+        for child in details:
+            details_data[to_snake_case(child.tag)] = text_or_none(child)
+        device.update(details_data)
+
+    components = root.findall("./Components/Component")
+    if components:
+        device["components"] = [parse_component(component) for component in components]
+
+    return device
+
+
+def parse_device_list_response(xml_text):
+    root = ElementTree.fromstring(xml_text)
+    if root.tag != "DeviceList":
+        raise ValueError(f"Expected <DeviceList> response, got <{root.tag}>")
+
+    devices = []
+    for device_element in root.findall("./Device"):
+        row = {}
+        for child in device_element:
+            row[to_snake_case(child.tag)] = text_or_none(child)
+        devices.append(row)
+
+    return devices
+
+
+def post_local_command(command_xml):
+    url = f"http://{args.eagle_host}/cgi-bin/post_manager"
+    if args.debug:
+        print("--- Eagle Local API Request ---")
+        print(command_xml)
+        print()
+    response = requests.post(
+        url=url,
+        data=command_xml,
+        headers={"Content-Type": "text/xml"},
+        auth=(args.eagle_user, args.eagle_pass),
+        timeout=args.eagle_timeout,
+    )
+    response.raise_for_status()
+    if args.debug:
+        print("--- Eagle Local API Response ---")
+        print(response.text)
+        print()
+    return response.text
+
+
+def fetch_device_list():
+    command_xml = "\r\n".join(
+        [
+            "<Command>",
+            "  <Name>device_list</Name>",
+            "</Command>",
+        ]
+    )
+    return parse_device_list_response(post_local_command(command_xml))
+
+
+def fetch_device_query_all(hardware_address):
+    command_xml = "\r\n".join(
+        [
+            "<Command>",
+            "  <Name>device_query</Name>",
+            "  <DeviceDetails>",
+            f"    <HardwareAddress>{hardware_address}</HardwareAddress>",
+            "  </DeviceDetails>",
+            "  <Components>",
+            "    <All>Y</All>",
+            "  </Components>",
+            "</Command>",
+        ]
+    )
+    return parse_device_response(post_local_command(command_xml))
+
+
+def fetch_wifi_status():
+    command_xml = "\r\n".join(
+        [
+            "<Command>",
+            "  <Name>wifi_status</Name>",
+            "</Command>",
+        ]
+    )
+    response_text = post_local_command(command_xml).strip()
+    if not response_text:
+        return {}
+    try:
+        root = ElementTree.fromstring(response_text)
+    except ElementTree.ParseError:
+        return {"raw": response_text}
+
+    wifi_data = {}
+    for child in root:
+        wifi_data[to_snake_case(child.tag)] = text_or_none(child)
+    return wifi_data
 
 
 def flatten_for_influx(data, prefix=""):
@@ -164,6 +274,12 @@ def measurement_name_for_device(device):
     return f"device_{sanitize_identifier(device.get('name'))}"
 
 
+def object_name_for_hardware(prefix, hardware_address):
+    if hardware_address:
+        return f"{prefix}_{hardware_address}"
+    return f"{prefix}_unknown"
+
+
 def meter_variables_to_fields(meter_data):
     """Flatten component variables to value-only field map."""
     fields = {}
@@ -249,45 +365,61 @@ def influxdb_publish(measurement, data, tags=None):
         print("  Payload was: %s" % payload)
 
 
-def collect_inventory_data(client):
-    snapshot = {"timestamp": int(time.time())}
+def collect_inventory_data():
+    snapshot = {"timestamp": int(time.time()), "ok": True}
 
-    wifi = client.wifi_status()
-    snapshot["wifi_status"] = object_to_data(wifi)
+    wifi_status = safe_local_call("wifi_status", fetch_wifi_status)
+    if wifi_status is not None:
+        snapshot["wifi_status"] = wifi_status
 
-    devices = client.device_list()
-    device_rows = []
-    for device in devices:
-        hardware_address = getattr(device, "hardware_address", None)
-        if not hardware_address:
-            continue
-
-        queried = client.device_query(hardware_address)
-        queried_data = object_to_data(queried)
-        queried_data = drop_null_value_objects(queried_data)[0]
-        queried_data.pop("all_variables", None)
-        queried_data.pop("components", None)
-        queried_data.pop("device_details", None)
-
-        device_rows.append(queried_data)
-
-    snapshot["devices"] = device_rows
+    devices = safe_local_call("device_list", fetch_device_list, default=[])
+    if not devices:
+        snapshot["ok"] = False
+    snapshot["devices"] = devices
     return snapshot
 
 
-def collect_meter_data(client, meter_addresses):
-    snapshot = {"timestamp": int(time.time()), "meters": []}
+def collect_meter_data(meter_addresses, device_shapes_by_address=None):
+    snapshot = {
+        "timestamp": int(time.time()),
+        "meters": [],
+        "devices": [],
+    }
     for hardware_address in meter_addresses:
-        try:
-            queried = client.device_query(hardware_address)
-        except Exception:
+        queried = safe_local_call(
+            f"device_query:{hardware_address}",
+            lambda addr=hardware_address: fetch_device_query_all(addr),
+        )
+        if queried is None:
             continue
 
-        meter_data = object_to_data(queried)
-        meter_data = drop_null_value_objects(meter_data)[0]
+        meter_data = drop_null_value_objects(queried)[0]
         meter_data.pop("all_variables", None)
+        meter_data.pop("device_details", None)
+        device_shape = (device_shapes_by_address or {}).get(hardware_address, {})
+        if device_shape:
+            device_data = {
+                key: meter_data.get(key)
+                for key in device_shape.keys()
+                if meter_data.get(key) is not None
+            }
+            # Preserve network_interface from device_query for compatibility.
+            network_interface = meter_data.get("network_interface")
+            if network_interface is not None:
+                device_data["network_interface"] = network_interface
+        else:
+            # Fallback if inventory shape is unavailable.
+            device_data = {
+                key: value
+                for key, value in meter_data.items()
+                if key not in {"all_variables", "components", "device_details"}
+                and value is not None
+            }
         meter_data = drop_unneeded_meter_variables(meter_data)
-        snapshot["meters"].append(meter_data)
+        meter_payload = {"components": meter_data.get("components", [])}
+
+        snapshot["devices"].append(device_data)
+        snapshot["meters"].append(meter_payload)
 
     return snapshot
 
@@ -302,15 +434,11 @@ def meter_addresses_from_inventory(inventory):
 
 def main():
     if args.debug:
-        eagle.localapi.enable_debug_logging()
-
-    configure_eagle_timeout(args.eagle_timeout)
-    client = eagle.LocalApi(
-        host=args.eagle_host, username=args.eagle_user, password=args.eagle_pass
-    )
+        print("Debug mode: direct Local API XML calls enabled")
 
     last_inventory_ts = 0
     meter_addresses = []
+    device_shapes_by_address = {}
     last_published_contact_by_device = {}
 
     while True:
@@ -321,27 +449,39 @@ def main():
         )
 
         if should_refresh_inventory:
-            inventory = collect_inventory_data(client)
-            meter_addresses = meter_addresses_from_inventory(inventory)
-            last_inventory_ts = now
+            inventory = collect_inventory_data()
+            if inventory.get("ok"):
+                meter_addresses = meter_addresses_from_inventory(inventory)
+                device_shapes_by_address = {
+                    device.get("hardware_address"): device
+                    for device in inventory.get("devices", [])
+                    if device.get("hardware_address")
+                }
+                last_inventory_ts = now
+            else:
+                print("Inventory refresh incomplete; reusing previous meter list")
 
             if args.raw:
                 print(json.dumps({"inventory": inventory}, indent=2, sort_keys=True, default=str))
 
             if args.influxdb:
                 publish_devices_snapshot(inventory.get("devices", []))
+                if inventory.get("wifi_status"):
+                    influxdb_publish("wifi_status", inventory.get("wifi_status"))
 
-        meters = collect_meter_data(client, meter_addresses)
+        meters = collect_meter_data(meter_addresses, device_shapes_by_address)
         if args.raw:
             print(json.dumps({"meters": meters}, indent=2, sort_keys=True, default=str))
 
         if args.influxdb:
-            wifi_status = object_to_data(client.wifi_status())
-            influxdb_publish("wifi_status", wifi_status)
+            for device_data, meter_data in zip(
+                meters.get("devices", []), meters.get("meters", [])
+            ):
+                hardware_address = device_data.get("hardware_address")
+                meter_object_name = object_name_for_hardware("device", hardware_address)
 
-            for meter in meters.get("meters", []):
-                device_key = meter.get("hardware_address") or measurement_name_for_device(meter)
-                last_contact = meter.get("last_contact")
+                device_key = hardware_address or "unknown"
+                last_contact = device_data.get("last_contact")
                 if (
                     last_contact is not None
                     and last_published_contact_by_device.get(device_key) == last_contact
@@ -351,7 +491,7 @@ def main():
                             json.dumps(
                                 {
                                     "influxdb_skip": {
-                                        "measurement": measurement_name_for_device(meter),
+                                        "measurement": meter_object_name,
                                         "reason": "last_contact_unchanged",
                                         "last_contact": last_contact,
                                     }
@@ -363,8 +503,9 @@ def main():
                         )
                     continue
 
-                fields = meter_variables_to_fields(meter)
-                influxdb_publish(measurement_name_for_device(meter), fields)
+                publish_devices_snapshot([device_data])
+                meter_fields = meter_variables_to_fields(meter_data)
+                influxdb_publish(meter_object_name, meter_fields)
                 if last_contact is not None:
                     last_published_contact_by_device[device_key] = last_contact
 
@@ -408,7 +549,7 @@ if __name__ == "__main__":
         action="store",
         default=30,
         type=int,
-        help="Eagle API request timeout in seconds",
+        help="Eagle Local API request timeout in seconds",
     )
 
     parser.add_argument(
@@ -459,13 +600,13 @@ if __name__ == "__main__":
         "--debug",
         dest="debug",
         action="store_true",
-        help="enable verbose Eagle API debug logging",
+        help="print direct Local API mode debug notice",
     )
     parser.add_argument(
         "--meter_poll_interval",
         dest="meter_poll_interval",
         action="store",
-        default=30,
+        default=10,
         type=int,
         help="meter polling interval in seconds",
     )
