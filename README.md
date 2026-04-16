@@ -1,4 +1,4 @@
-# Eagle Exporter
+# eagle-exporter
 
 Lightweight Python exporter for the Rainforest Automation Eagle local API.
 
@@ -19,9 +19,9 @@ It polls Eagle devices (with a focus on electric meters), normalizes values, and
 
 - Python 3
 - An Eagle gateway with local API access
-- Python API client: [`rfa-eagle-api` by tonymitchell](https://github.com/tonymitchell/rfa-eagle-api)
-- Eagle hardware product page: [Rainforest Automation Eagle-3](https://rainforestautomation.com/us-retail-store/eagle-3-energy-gateway-and-smart-home-hub/)
-- (Optional) InfluxDB (this project uses the `influxdb` Python client, typically for InfluxDB 1.x HTTP API)
+- Eagle hardware product page: [Rainforest Automation Eagle-200/Eagle-3](https://rainforestautomation.com/us-retail-store/eagle-3-energy-gateway-and-smart-home-hub/)
+- `requests` (direct HTTP calls to the Eagle local API — no third-party Eagle library required)
+- (Optional) InfluxDB — this project uses the `influxdb` Python client, typically for InfluxDB 1.x HTTP API
 
 Install Python dependencies:
 
@@ -68,11 +68,11 @@ python3 eagle-exporter.py \
 - `--influxdb_user`
 - `--influxdb_pass`
 - `--influxdb_db` (default: `eagle`)
-- `--meter_poll_interval` (default: `30` seconds)
+- `--meter_poll_interval` (default: `10` seconds)
 - `--inventory_poll_interval` (default: `86400` seconds)
 - `--eagle_timeout` (default: `30` seconds)
 - `--verbose`: log Influx payloads and skip reasons
-- `--debug`: enable verbose Eagle API debug logging
+- `--debug`: print raw request/response XML for each Eagle API call
 
 ## Data model (InfluxDB)
 
@@ -121,3 +121,5 @@ journalctl -u eagle-exporter -f
 
 - Credentials are passed as CLI args in this project; prefer secure host practices and file permissions around environment files.
 - If you only need local inspection/debugging, run with `--raw` and without `--influxdb`.
+- The Eagle's local HTTP server can become overloaded if polled too frequently. If you see repeated 503 errors or XML parse failures, increase `--meter_poll_interval` and add `RestartSec=60` to the systemd unit to prevent rapid restart loops from hammering the device.
+- The exporter communicates with the Eagle directly over HTTP using Basic Auth (Cloud ID as username, Installation ID as password) — no third-party Eagle library is required.
